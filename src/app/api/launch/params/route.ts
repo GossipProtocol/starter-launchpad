@@ -1,0 +1,126 @@
+import { NextResponse } from "next/server";
+import { createPublicClient, formatEther, type Address } from "viem";
+import { DopplerSDK } from "@whetstone-research/doppler-sdk/evm";
+import { validateCombo } from "@/lib/emoji";
+import { validateMeme } from "@/lib/meme-coin";
+import { chainById } from "@/config/chains";
+import { chainLaunchable, findNumeraire } from "@/lib/numeraire";
+import { isClaimed } from "@/lib/data";
+import { launchQuota } from "@/lib/limits";
+import { WALLET_CLAIMS_OPEN } from "@/config/limits";
+import { stockPriceServer } from "@/lib/market";
+import { buildParams } from "@/lib/doppler";
+import { transportFor } from "@/lib/rpc";
+import { CURVE_DEFAULTS } from "@/config/curve";
+import { FEE_DECAY_SECONDS, FEE_END, FEE_START, SHARE_COURSE, SHARE_CREATOR, SHARE_PROTOCOL, WAD } from "@/config/fees";
+import { SITE_URL } from "@/lib/network";
+import { courseFeeConfigured } from "@/config/course-fee";
+
+export const dynamic = "force-dynamic";
+export const runtime = "nodejs";
+export const maxDuration = 30;
+
+const MCAP_MIN = 1_000;
+const MCAP_MAX = 10_000_000;
+
+const pageFor = (display: string, ticker: string, chainId: number) => `${SITE_URL}/m/${encodeURIComponent(display)}/${encodeURIComponent(ticker)}${chainId !== 4663 ? `/${chainId}` : ""}`;
+
+const fail = (error: string, code: string, status: number, extra: Record<string, unknown> = {}) => NextResponse.json({ error, code, ...extra }, { status });
+
+/**
+ * GET /api/launch/params?combo=🍏&pair=AAPL&creator=0x…[&chainId=4663][&mcap=5000]
+ * GET /api/launch/params?kind=meme&name=Pepe&symbol=PEPE&pair=ETH&creator=0x…   (a memecoin: title + ticker)
+ *
+ * The launch, assembled server-side for a wallet that is not in a browser: the exact Airlock `create` calldata the
+ * app would sign, ready to send from `creator`. Refuses (with a code) before any gas is spent when the combo is
+ * invalid or already paired, the pair is not listed, or the wallet has used its launch slots. The chain, the pair and the fee
+ * structure are the same as the app's; nothing here is configurable beyond the launch market cap.
+ *
+ * Send `tx` from `creator` (it must be the tx sender), wait for the receipt, then POST /api/launch with `then.record.body`
+ * plus the tx hash. `predicted` is what the chain will produce for this exact calldata (a fresh salt per call).
+ */
+export async function GET(req: Request) {
+  if (!courseFeeConfigured()) return fail("COURSE_FEE_RECIPIENT in src/config/course-fee.ts is unset; the deployment cannot build a launch until it is", "SERVER_MISCONFIGURED", 500);
+  if (!WALLET_CLAIMS_OPEN) return fail("Wallet launches are closed; launch from the app with an X account", "WALLET_CLAIMS_CLOSED", 403);
+  const q = new URL(req.url).searchParams;
+  // A moji (emoji combo) or, with kind=meme, a memecoin whose ticker is the claim (`$PEPE`, src/lib/meme-coin.ts).
+  let v: Extract<ReturnType<typeof validateCombo>, { ok: true }>;
+  let meme: { name: string; symbol: string } | null = null;
+  if (q.get("kind") === "meme") {
+    const mv = validateMeme({ name: q.get("name"), symbol: q.get("symbol") });
+    if (!mv.ok) return fail(mv.reason, "BAD_MEME", 400);
+    meme = { name: mv.name, symbol: mv.symbol };
+    v = { ok: true, emoji: [], display: mv.display, normalized: mv.normalized };
+  } else {
+    const cv = validateCombo(q.get("combo") ?? "");
+    if (!cv.ok) return fail(cv.reason, "BAD_COMBO", 400);
+    v = cv;
+  }
+
+  const chain = chainById(Number(q.get("chainId") ?? 4663));
+  if (!chain || !chainLaunchable(chain) || !chain.viem) return fail("That chain is not live yet", "CHAIN_NOT_LIVE", 400);
+
+  const stock = findNumeraire(chain.chainId, q.get("pair") ?? "");
+  if (!stock) return fail("Pair must be a listed stock or token on this chain (ticker or address). See GET /api/pairs", "PAIR_NOT_LISTED", 400);
+
+  const creator = (q.get("creator") ?? "") as Address;
+  if (!/^0x[0-9a-fA-F]{40}$/.test(creator)) return fail("creator must be the 0x address that will send the launch tx", "BAD_INPUT", 400);
+
+  const mcapStart = q.get("mcap") ? Number(q.get("mcap")) : CURVE_DEFAULTS.mcapStart;
+  if (!Number.isFinite(mcapStart) || mcapStart < MCAP_MIN || mcapStart > MCAP_MAX) return fail(`mcap must be between ${MCAP_MIN} and ${MCAP_MAX} USD`, "BAD_INPUT", 400);
+
+  const taken = await isClaimed(v.normalized, chain.chainId, stock.address);
+  if (taken.claimed) {
+    return fail(`${v.display} is already paired to ${stock.ticker} on ${chain.short}`, "CLAIMED", 409, { owner: pageFor(taken.display ?? v.display, taken.ticker ?? stock.ticker, chain.chainId) });
+  }
+
+  const quota = await launchQuota({ address: creator });
+  if (quota.blocked) return fail(quota.message ?? "Launch cap reached", "NO_SLOTS", 429, { quota });
+
+  const stockPriceUsd = await stockPriceServer(chain.chainId, stock.address, stock.ticker);
+  if (!(stockPriceUsd > 0)) return fail(`No USD price for ${stock.ticker} right now`, "NO_PRICE", 502);
+
+  const curve = { ...CURVE_DEFAULTS, mcapStart };
+  try {
+    const params = await buildParams({ chain, stock, combo: v.display, ...(meme ?? {}), creator, curve, stockPriceUsd });
+    const publicClient = createPublicClient({ chain: chain.viem, transport: transportFor(chain.viem) });
+    const sdk = new DopplerSDK({ publicClient, chainId: chain.chainId });
+    const [prepared, gasPrice] = await Promise.all([sdk.factory.prepareCreateMulticurve(params, { account: creator }), publicClient.getGasPrice()]);
+    const gas = prepared.gasEstimate.status === "estimated" ? prepared.gasEstimate.gas : null;
+    const costWei = gas ? (gas * gasPrice * 12n) / 10n : null;
+    const pct = (wad: bigint) => Number((wad * 10000n) / WAD) / 100;
+
+    return NextResponse.json(
+      {
+        ok: true,
+        combo: { display: v.display, normalized: v.normalized, emoji: v.emoji, kind: meme ? "meme" : "moji", ...(meme ?? {}) },
+        chain: { id: chain.chainId, name: chain.name, gasSymbol: chain.gasSymbol, explorer: chain.viem.blockExplorers?.default.url ?? null },
+        pair: { ticker: stock.ticker, name: stock.name, address: stock.address, decimals: stock.decimals, priceUsd: stockPriceUsd },
+        creator,
+        launch: { supply: curve.supply, sellFraction: curve.sellFraction, mcapStartUsd: curve.mcapStart },
+        fees: {
+          swap: { startPct: FEE_START / 1e4, endPct: FEE_END / 1e4, decaySeconds: FEE_DECAY_SECONDS },
+          split: { creatorPct: pct(SHARE_CREATOR), coursePct: pct(SHARE_COURSE), protocolPct: pct(SHARE_PROTOCOL) },
+        },
+        predicted: { tokenAddress: prepared.prediction.tokenAddress, poolId: prepared.prediction.poolId, poolOrHookAddress: prepared.prediction.poolOrHookAddress },
+        tx: { chainId: chain.chainId, from: creator, to: prepared.transaction.to, data: prepared.transaction.data, value: prepared.transaction.value.toString(), gas: gas?.toString() ?? null },
+        gas: { estimate: gas?.toString() ?? null, priceWei: gasPrice.toString(), costWei: costWei?.toString() ?? null, costNative: costWei ? formatEther(costWei) : null, minNative: chain.minGasNative },
+        quota,
+        then: {
+          record: {
+            method: "POST",
+            url: `${SITE_URL}/api/launch`,
+            body: { combo: v.display, ...(meme ? { kind: "meme", name: meme.name, symbol: meme.symbol } : {}), chainId: chain.chainId, stockAddress: stock.address, tokenAddress: prepared.prediction.tokenAddress, poolId: prepared.prediction.poolId, txHash: "<hash of the sent tx>", supply: String(curve.supply), creatorAddress: creator, agent: true },
+          },
+          // A meme needs its picture: upload it right after recording (multipart `file` + `signer` + `signature`, see SKILL.md "Memes").
+          ...(meme ? { picture: { method: "POST", url: `${SITE_URL}/api/mojis/${encodeURIComponent(v.display)}/meme?chain=${chain.chainId}&pair=${stock.address}`, sign: `launch lab meme <moji.id from the record response> set <sha256 hex of the file>` } } : {}),
+          page: pageFor(v.display, stock.ticker, chain.chainId),
+        },
+      },
+      { headers: { "cache-control": "no-store" } },
+    );
+  } catch (e) {
+    const msg = e instanceof Error ? ((e as Error & { shortMessage?: string }).shortMessage ?? e.message) : String(e);
+    return fail(`Could not assemble the launch: ${msg.split("\n")[0].slice(0, 240)}`, "BUILD_FAILED", 502);
+  }
+}

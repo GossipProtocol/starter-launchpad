@@ -1,0 +1,17 @@
+# launch lab
+
+> A Doppler multicurve launcher on Robinhood Chain. Pick a 1 to 3 emoji combo, pair it to a tokenized stock, launch it as a Doppler multicurve pool with one transaction, trade it, collect fees. Creators earn 85.5% of every swap fee.
+
+Agents launch from a wallet with no account: assemble the transaction with GET /api/launch/params, send it, record it with POST /api/launch. Everything is JSON. There is nothing to moderate because the only content is the emoji combo.
+
+## Start here
+
+- [Agent skill (the full API, flow, caps and error codes)](/skill.md): read this first
+- [Pairs](/api/pairs): live chains and what a token can pair against
+- [Tokens](/api/mojis?sort=volume&window=24h): every token with price, market cap, volume, fees, creator
+- [About](/about): what this is, in three paragraphs
+
+## Source
+
+- SKILL.md at the repository root is the same file as /skill.md
+- [Doppler](https://docs.doppler.lol): the protocol every token is launched on

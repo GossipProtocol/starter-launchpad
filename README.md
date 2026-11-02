@@ -11,7 +11,7 @@ It runs in two modes:
 
 Every token this app launches names the course wallet in the Airlock `create` call twice: as the **Doppler integrator**, and as a **fee beneficiary with 9.5% of the pool's swap fees**. The Doppler protocol owner keeps the 5% the SDK enforces and the creator keeps the remaining 85.5%. The course share is 10% of what would otherwise be the creator's 95%. 100% of supply stays on the curve; the fee is a share of swap fees, never a slice of the token. The rate (`COURSE_FEE_BPS`) and the recipient (`COURSE_FEE_RECIPIENT`) live in one file, `src/config/course-fee.ts`, and the launch builder, the params endpoint, the sponsor and the verifier all refuse to run while the recipient is the zero address.
 
-The fee is a default, not a license condition. This code is MIT licensed, so you can change it, but the fee is how the course pays for itself and the rate is small enough that most forks leave it. If you change the recipient or the rate, say so in your README.
+The fee is a default, not a license condition. This code is MIT licensed, so you can change it. If you change the recipient or the rate, say so in your README.
 
 ## What is in the box
 
